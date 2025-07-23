@@ -149,7 +149,7 @@ intersphinx_mapping = {
     "jinja": ("https://jinja.palletsprojects.com/en/stable/", None),
     "linuxdoc" : ("https://return42.github.io/linuxdoc/", None),
     "sphinx" : ("https://www.sphinx-doc.org/en/master/", None),
-    "redis": ('https://redis.readthedocs.io/en/stable/', None),
+    "valkey": ('https://valkey-py.readthedocs.io/en/stable/', None),
 }
 
 issues_github_path = "searxng/searxng"
@@ -161,7 +161,7 @@ issues_github_path = "searxng/searxng"
 notfound_urls_prefix = '/'
 
 sys.path.append(os.path.abspath('_themes'))
-sys.path.insert(0, os.path.abspath("../utils/"))
+sys.path.insert(0, os.path.abspath("../"))
 html_theme_path = ['_themes']
 html_theme = "searxng"
 

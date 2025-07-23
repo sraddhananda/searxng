@@ -6,8 +6,7 @@
 # pylint: disable=use-dict-literal
 from __future__ import annotations
 
-import hashlib
-import hmac
+import inspect
 import json
 import os
 import sys
@@ -29,6 +28,8 @@ from pygments import highlight
 from pygments.lexers import get_lexer_by_name
 from pygments.formatters import HtmlFormatter  # pylint: disable=no-name-in-module
 
+from werkzeug.serving import is_running_from_reloader
+
 import flask
 
 from flask import (
@@ -48,12 +49,12 @@ from flask_babel import (
     format_decimal,
 )
 
+import searx
 from searx.extended_types import sxng_request
 from searx import (
     logger,
     get_setting,
     settings,
-    searx_debug,
 )
 
 from searx import infopage
@@ -75,13 +76,11 @@ from searx.engines import (
 from searx import webutils
 from searx.webutils import (
     highlight_content,
-    get_static_files,
     get_result_templates,
     get_themes,
     exception_classname_to_text,
     new_hmac,
     is_hmac_of,
-    is_flask_run_cmdline,
     group_engines_in_tab,
 )
 from searx.webadapter import (
@@ -106,6 +105,7 @@ from searx.metrics import get_engines_stats, get_engine_errors, get_reliabilitie
 from searx.flaskfix import patch_application
 
 from searx.locales import (
+    LOCALE_BEST_MATCH,
     LOCALE_NAMES,
     RTL_LOCALES,
     localeselector,
@@ -117,7 +117,7 @@ from searx.locales import (
 from searx.autocomplete import search_autocomplete, backends as autocomplete_backends
 from searx import favicons
 
-from searx.redisdb import initialize as redis_initialize
+from searx.valkeydb import initialize as valkey_initialize
 from searx.sxng_locales import sxng_locales
 import searx.search
 from searx.network import stream as http_stream, set_context_network_name
@@ -128,14 +128,8 @@ logger = logger.getChild('webapp')
 
 warnings.simplefilter("always")
 
-# check secret_key
-if not searx_debug and settings['server']['secret_key'] == 'ultrasecretkey':
-    logger.error('server.secret_key is not changed. Please use something else instead of ultrasecretkey.')
-    sys.exit(1)
-
 # about static
 logger.debug('static directory is %s', settings['ui']['static_path'])
-static_files = get_static_files(settings['ui']['static_path'])
 
 # about templates
 logger.debug('templates directory is %s', settings['ui']['templates_path'])
@@ -243,43 +237,44 @@ def get_result_template(theme_name: str, template_name: str):
     return 'result_templates/' + template_name
 
 
+_STATIC_FILES: list[str] = []
+
+
 def custom_url_for(endpoint: str, **values):
-    suffix = ""
-    if endpoint == 'static' and values.get('filename'):
-        file_hash = static_files.get(values['filename'])
-        if not file_hash:
+    global _STATIC_FILES  # pylint: disable=global-statement
+    if not _STATIC_FILES:
+        _STATIC_FILES = webutils.get_static_file_list()
+
+    if endpoint == "static" and values.get("filename"):
+
+        # We need to verify the "filename" argument: in the jinja templates
+        # there could be call like:
+        #     url_for('static', filename='img/favicon.png')
+        # which should map to:
+        #     static/themes/<theme_name>/img/favicon.png
+
+        arg_filename = values["filename"]
+        if arg_filename not in _STATIC_FILES:
             # try file in the current theme
-            theme_name = sxng_request.preferences.get_value('theme')
-            filename_with_theme = "themes/{}/{}".format(theme_name, values['filename'])
-            file_hash = static_files.get(filename_with_theme)
-            if file_hash:
-                values['filename'] = filename_with_theme
-        if get_setting('ui.static_use_hash') and file_hash:
-            suffix = "?" + file_hash
-    if endpoint == 'info' and 'locale' not in values:
-        locale = sxng_request.preferences.get_value('locale')
-        if infopage.INFO_PAGES.get_page(values['pagename'], locale) is None:
+            theme_name = sxng_request.preferences.get_value("theme")
+            arg_filename = f"themes/{theme_name}/{arg_filename}"
+            if arg_filename in _STATIC_FILES:
+                values["filename"] = arg_filename
+
+    if endpoint == "info" and "locale" not in values:
+
+        # We need to verify the "locale" argument: in the jinja templates there
+        # could be call like:
+        #     url_for('info', pagename='about')
+        # which should map to:
+        #     info/<locale>/about
+
+        locale = sxng_request.preferences.get_value("locale")
+        if infopage.INFO_PAGES.get_page(values["pagename"], locale) is None:
             locale = infopage.INFO_PAGES.locale_default
-        values['locale'] = locale
-    return url_for(endpoint, **values) + suffix
+        values["locale"] = locale
 
-
-def morty_proxify(url: str):
-    if not url:
-        return url
-
-    if url.startswith('//'):
-        url = 'https:' + url
-
-    if not settings['result_proxy']['url']:
-        return url
-
-    url_params = dict(mortyurl=url)
-
-    if settings['result_proxy']['key']:
-        url_params['mortyhash'] = hmac.new(settings['result_proxy']['key'], url.encode(), hashlib.sha256).hexdigest()
-
-    return '{0}?{1}'.format(settings['result_proxy']['url'], urlencode(url_params))
+    return url_for(endpoint, **values)
 
 
 def image_proxify(url: str):
@@ -302,9 +297,6 @@ def image_proxify(url: str):
         ):
             return url
         return None
-
-    if settings['result_proxy']['url']:
-        return morty_proxify(url)
 
     h = new_hmac(settings['server']['secret_key'], url.encode())
 
@@ -427,8 +419,6 @@ def render(template_name: str, **kwargs):
     kwargs['url_for'] = custom_url_for  # override url_for function in templates
     kwargs['image_proxify'] = image_proxify
     kwargs['favicon_url'] = favicons.favicon_url
-    kwargs['proxify'] = morty_proxify if settings['result_proxy']['url'] is not None else None
-    kwargs['proxify_results'] = settings['result_proxy']['proxify_results']
     kwargs['cache_url'] = settings['ui']['cache_url']
     kwargs['get_result_template'] = get_result_template
     kwargs['opensearch_url'] = (
@@ -1087,10 +1077,12 @@ def image_proxy():
 
 @app.route('/engine_descriptions.json', methods=['GET'])
 def engine_descriptions():
-    locale = get_locale().split('_')[0]
+    sxng_ui_lang_tag = get_locale().replace("_", "-")
+    sxng_ui_lang_tag = LOCALE_BEST_MATCH.get(sxng_ui_lang_tag, sxng_ui_lang_tag)
+
     result = ENGINE_DESCRIPTIONS['en'].copy()
-    if locale != 'en':
-        for engine, description in ENGINE_DESCRIPTIONS.get(locale, {}).items():
+    if sxng_ui_lang_tag != 'en':
+        for engine, description in ENGINE_DESCRIPTIONS.get(sxng_ui_lang_tag, {}).items():
             result[engine] = description
     for engine, description in result.items():
         if len(description) == 2 and description[1] == 'ref':
@@ -1329,45 +1321,112 @@ def page_not_found(_e):
     return render('404.html'), 404
 
 
-# see https://flask.palletsprojects.com/en/1.1.x/cli/
-# True if "FLASK_APP=searx/webapp.py FLASK_ENV=development flask run"
-flask_run_development = (
-    os.environ.get("FLASK_APP") is not None and os.environ.get("FLASK_ENV") == 'development' and is_flask_run_cmdline()
-)
+def run():
+    """Runs the application on a local development server.
 
-# True if reload feature is activated of werkzeug, False otherwise (including uwsgi, etc..)
-#  __name__ != "__main__" if searx.webapp is imported (make test, make docs, uwsgi...)
-# see run() at the end of this file : searx_debug activates the reload feature.
-werkzeug_reloader = flask_run_development or (searx_debug and __name__ == "__main__")
+    This run method is only called when SearXNG is started via ``__main__``::
 
-# initialize the engines except on the first run of the werkzeug server.
-if not werkzeug_reloader or (werkzeug_reloader and os.environ.get("WERKZEUG_RUN_MAIN") == "true"):
+        python -m searx.webapp
+
+    Do not use :ref:`run() <flask.Flask.run>` in a production setting.  It is
+    not intended to meet security and performance requirements for a production
+    server.
+
+    It is not recommended to use this function for development with automatic
+    reloading as this is badly supported.  Instead you should be using the flask
+    command line script’s run support::
+
+        flask --app searx.webapp run --debug --reload --host 127.0.0.1 --port 8888
+
+    .. _Flask.run: https://flask.palletsprojects.com/en/stable/api/#flask.Flask.run
+    """
+
+    host: str = get_setting("server.bind_address")  # type: ignore
+    port: int = get_setting("server.port")  # type: ignore
+
+    if searx.sxng_debug:
+        logger.debug("run local development server (DEBUG) on %s:%s", host, port)
+        app.run(
+            debug=True,
+            port=port,
+            host=host,
+            threaded=True,
+            extra_files=[DEFAULT_SETTINGS_FILE],
+        )
+    else:
+        logger.debug("run local development server on %s:%s", host, port)
+        app.run(port=port, host=host, threaded=True)
+
+
+def is_werkzeug_reload_active() -> bool:
+    """Returns ``True`` if server is is launched by :ref:`werkzeug.serving` and
+    the ``use_reload`` argument was set to ``True``.  If this is the case, it
+    should be avoided that the server is initialized twice (:py:obj:`init`,
+    :py:obj:`run`).
+
+    .. _werkzeug.serving:
+       https://werkzeug.palletsprojects.com/en/stable/serving/#werkzeug.serving.run_simple
+    """
+    logger.debug("sys.argv: %s", sys.argv)
+    if "uwsgi" in sys.argv[0] or "granian" in sys.argv[0]:
+        # server was launched by granian (or uWSGI)
+        return False
+
+    # https://github.com/searxng/searxng/pull/1656#issuecomment-1214198941
+    # https://github.com/searxng/searxng/pull/1616#issuecomment-1206137468
+
+    frames = inspect.stack()
+
+    if len(frames) > 1 and frames[-2].filename.endswith('flask/cli.py'):
+        # server was launched by "flask run", is argument "--reload" set?
+        if "--reload" in sys.argv or "--debug" in sys.argv:
+            return True
+
+    elif frames[0].filename.endswith('searx/webapp.py'):
+        # server was launched by "python -m searx.webapp" / see run()
+        if searx.sxng_debug:
+            return True
+
+    return False
+
+
+def init():
+
+    if searx.sxng_debug or app.debug:
+        app.debug = True
+        searx.sxng_debug = True
+
+    # check secret_key in production
+
+    if not app.debug and get_setting("server.secret_key") == 'ultrasecretkey':
+        logger.error("server.secret_key is not changed. Please use something else instead of ultrasecretkey.")
+        sys.exit(1)
+
+    # When automatic reloading is activated stop Flask from initialising twice.
+    # - https://github.com/pallets/flask/issues/5307#issuecomment-1774646119
+    # - https://stackoverflow.com/a/25504196
+
+    reloader_active = is_werkzeug_reload_active()
+    werkzeug_run_main = is_running_from_reloader()
+
+    if reloader_active and not werkzeug_run_main:
+        logger.info("in reloading mode and not in main loop, cancel the initialization")
+        return
+
     locales_initialize()
-    redis_initialize()
+    valkey_initialize()
     searx.plugins.initialize(app)
-    searx.search.initialize(
-        enable_checker=True,
-        check_network=True,
-        enable_metrics=get_setting("general.enable_metrics"),
-    )
+
+    metrics: bool = get_setting("general.enable_metrics")  # type: ignore
+    searx.search.initialize(enable_checker=True, check_network=True, enable_metrics=metrics)
+
     limiter.initialize(app, settings)
     favicons.init()
 
 
-def run():
-    logger.debug('starting webserver on %s:%s', settings['server']['bind_address'], settings['server']['port'])
-    app.run(
-        debug=searx_debug,
-        use_debugger=searx_debug,
-        port=settings['server']['port'],
-        host=settings['server']['bind_address'],
-        threaded=True,
-        extra_files=[DEFAULT_SETTINGS_FILE],
-    )
-
-
 application = app
 patch_application(app)
+init()
 
 if __name__ == "__main__":
     run()
